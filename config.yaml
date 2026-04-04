@@ -1,0 +1,45 @@
+ollama:
+  host: "http://localhost:11434"
+  models:
+    embedding: "nomic-embed-text"
+    summary: "phi3:mini"
+    overview: "phi3:mini"
+    chat: "qwen2.5:7b"
+  timeout: 120
+
+memory:
+  tiers:
+    l1:
+      max_items: 1000
+      retention_days: 7
+      vector_dim: 768
+    l2:
+      max_items: 10000
+      retention_days: 30
+      vector_dim: 768
+      compression: "zlib"
+    l3:
+      max_items: 100000
+      archive_path: "./archives/"
+      vector_dim: 768
+
+  deduplication:
+    simhash_threshold: 3
+    vector_threshold: 0.92
+    auto_merge: false
+
+chunking:
+  default_chunk_size: 500
+  chunk_overlap: 50
+  code_chunk_by_function: true
+  markdown_chunk_by_heading: true
+
+search:
+  default_top_k: 10
+  rrf_k: 60
+  auto_tier_fallback: true
+
+web:
+  host: "0.0.0.0"
+  port: 3000
+  max_upload_size_mb: 50
