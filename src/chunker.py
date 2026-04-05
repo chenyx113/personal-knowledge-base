@@ -324,11 +324,32 @@ def extract_text_from_file(file_path: str) -> str:
     elif suffix == ".pdf":
         # Basic PDF text extraction (requires no extra deps)
         return _extract_pdf_text(file_path)
+    elif suffix == ".docx":
+        return _extract_docx_text(file_path)
     else:
         try:
             return p.read_text(encoding="utf-8", errors="replace")
         except Exception:
             return ""
+
+
+def _extract_docx_text(file_path: str) -> str:
+    """Extract text from a .docx file using python-docx library."""
+    try:
+        from docx import Document
+        doc = Document(file_path)
+        paragraphs = [para.text for para in doc.paragraphs if para.text.strip()]
+        # Also extract text from tables
+        for table in doc.tables:
+            for row in table.rows:
+                for cell in row.cells:
+                    if cell.text.strip():
+                        paragraphs.append(cell.text.strip())
+        return "\n\n".join(paragraphs)
+    except ImportError:
+        return f"[DOCX file: {file_path} - install python-docx for full extraction]"
+    except Exception as e:
+        return f"[Error reading DOCX file: {file_path}: {str(e)}]"
 
 
 def _extract_pdf_text(file_path: str) -> str:

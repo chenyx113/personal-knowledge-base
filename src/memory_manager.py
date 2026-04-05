@@ -127,7 +127,7 @@ class MemoryManager:
 
     def _ingest_chunk(self, doc_id: int, chunk: ChunkResult,
                       existing_records: List[Dict]) -> Dict:
-        """Process a single chunk: embed, dedup, store."""
+        """Process a single chunk: embed, dedup, store in L1/L2/L3."""
         content = chunk.content
         if not content.strip():
             return {"added": False}
@@ -176,7 +176,7 @@ class MemoryManager:
         summary = self.generator.generate_summary(content)
         overview = self.generator.generate_overview(content)
 
-        # Store in L1
+        # Store in L1 (working memory - full content)
         l1_id = self.db.insert_l1(
             doc_id=doc_id,
             chunk_index=chunk.index,
@@ -189,6 +189,44 @@ class MemoryManager:
             vector_dim=len(vec),
             start_line=chunk.start_line,
             end_line=chunk.end_line,
+        )
+
+        # Store in L2 (short-term memory - compressed summary)
+        l2_summary = summary or content[:200]
+        compressed_l2 = zlib.compress(l2_summary.encode("utf-8"))
+        self.db.insert_l2(
+            l1_id=l1_id,
+            content_hash=content_hash,
+            compressed_content=compressed_l2,
+            compressed_vector=vec_bytes,
+            summary=l2_summary,
+        )
+
+        # Store in L3 (long-term memory - archive with key concepts)
+        l3_overview = overview or (summary[:100] if summary else content[:100])
+        key_concepts = semantic_hash
+        
+        # Quantize vector to int8 for L3 (smaller storage)
+        quantized = np.clip(vec * 127, -128, 127).astype(np.int8)
+        quantized_vec_bytes = quantized.tobytes()
+        
+        # Create archive file
+        archive_path = self.config.get("memory", {}).get("tiers", {}).get(
+            "l3", {}
+        ).get("archive_path", "./archives/")
+        Path(archive_path).mkdir(parents=True, exist_ok=True)
+        archive_file = str(Path(archive_path) / f"{content_hash[:16]}.zlib")
+        
+        compressed_full = zlib.compress(content.encode("utf-8"))
+        with open(archive_file, "wb") as f:
+            f.write(compressed_full)
+
+        self.db.insert_l3(
+            content_hash=content_hash,
+            key_concepts=key_concepts,
+            overview=l3_overview,
+            archive_path=archive_file,
+            compressed_vector=quantized_vec_bytes,
         )
 
         record = {
