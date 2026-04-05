@@ -5,3 +5,5 @@ requests>=2.31.0
 pyyaml>=6.0
 numpy>=1.24.0
 jieba>=0.42.1
+python-docx>=0.8.11
+pypdf>=3.0.0

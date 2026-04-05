@@ -4,7 +4,7 @@ ollama:
     embedding: "nomic-embed-text"
     summary: "phi3:mini"
     overview: "phi3:mini"
-    chat: "qwen2.5:7b"
+    chat: "qwen3:4b"
   timeout: 120
 
 memory:
