@@ -1,5 +1,7 @@
 # Personal Knowledge Base - User Manual
 
+![UI](main_ui.png)
+
 ## Three-Tier Memory System with Intelligent Deduplication
 
 Version 1.0.0
