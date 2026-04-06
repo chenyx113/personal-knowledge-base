@@ -252,10 +252,11 @@ Type a query and press Enter or click Search. Results show:
 - Source file and line numbers
 
 #### Add Content
-Click "+ Add" to open the upload modal:
-- **Upload File**: Drag & drop or click to browse. Supports all text-based file types.
+Click "+ Add" to open the upload modal with three options:
+- **Upload File**: Drag & drop or click to browse. Supports all text-based file types. Multiple files can be selected at once.
+- **Upload Folder**: Select an entire folder (with optional subdirectories). All supported files in the folder will be uploaded and ingested.
 - **Paste Text**: Directly paste content. Saved as Markdown note.
-- Set optional title and comma-separated tags.
+- Set optional title and comma-separated tags (applies to all uploaded content).
 
 #### Document Details
 Click any document to see:
@@ -287,7 +288,8 @@ The web server exposes a REST API:
 |--------|----------|-------------|
 | GET | `/api/stats` | Knowledge base statistics |
 | GET | `/api/search?q=...&tier=&top_k=&tag=` | Hybrid search |
-| POST | `/api/ingest` | Upload file (multipart form) |
+| POST | `/api/ingest` | Upload single file (multipart form) |
+| POST | `/api/ingest-directory` | Ingest all files from uploads directory |
 | POST | `/api/ingest-text` | Ingest raw text |
 | GET | `/api/documents` | List documents |
 | GET | `/api/documents/{id}` | Document detail with chunks |

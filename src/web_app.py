@@ -64,7 +64,10 @@ def create_app(db_path: str = "kb.db", config: dict = None) -> FastAPI:
         # Save uploaded file temporarily
         upload_dir = Path("files/uploads")
         upload_dir.mkdir(parents=True, exist_ok=True)
+        
+        # Handle subdirectory paths in filename (from folder upload)
         dest = upload_dir / file.filename
+        dest.parent.mkdir(parents=True, exist_ok=True)
 
         content = await file.read()
         with open(dest, "wb") as f:
@@ -73,6 +76,22 @@ def create_app(db_path: str = "kb.db", config: dict = None) -> FastAPI:
         tag_list = [t.strip() for t in tags.split(",") if t.strip()] if tags else []
         result = await asyncio.to_thread(
             mm.ingest_file, str(dest), tag_list, title
+        )
+        return result
+
+    @app.post("/api/ingest-directory")
+    async def api_ingest_directory(
+        tags: str = Form(""),
+        recursive: bool = Form(True),
+    ):
+        """Ingest all supported files from the uploads directory."""
+        upload_dir = Path("files/uploads")
+        if not upload_dir.exists():
+            return {"status": "error", "message": "Upload directory not found"}
+
+        tag_list = [t.strip() for t in tags.split(",") if t.strip()] if tags else []
+        result = await asyncio.to_thread(
+            mm.ingest_directory, str(upload_dir), recursive, tag_list
         )
         return result
 
@@ -363,6 +382,7 @@ border-bottom:1px solid var(--border);max-height:40vh}}
     <h3>Add to Knowledge Base</h3>
     <div style="display:flex;gap:8px;margin-bottom:16px">
       <button class="tier-tab active" onclick="switchUploadTab(this,'file')">Upload File</button>
+      <button class="tier-tab" onclick="switchUploadTab(this,'folder')">Upload Folder</button>
       <button class="tier-tab" onclick="switchUploadTab(this,'text')">Paste Text</button>
     </div>
     <div id="uploadFile">
@@ -374,6 +394,23 @@ border-bottom:1px solid var(--border);max-height:40vh}}
         <input type="file" id="fileInput" hidden multiple onchange="handleFiles(this.files)">
       </div>
       <div id="fileList" style="font-size:13px;color:var(--text2)"></div>
+    </div>
+    <div id="uploadFolder" style="display:none">
+      <div class="upload-zone" onclick="document.getElementById('folderInput').click()"
+           ondragover="event.preventDefault();this.classList.add('dragover')"
+           ondragleave="this.classList.remove('dragover')"
+           ondrop="event.preventDefault();this.classList.remove('dragover');handleFolderDrop(event)">
+        Drop a folder here or click to browse
+        <input type="file" id="folderInput" hidden webkitdirectory mozdirectory directory multiple
+               onchange="handleFolderFiles(this.files)">
+      </div>
+      <div class="form-group" style="margin-top:12px">
+        <label style="display:flex;align-items:center;gap:8px">
+          <input type="checkbox" id="recursiveCheck" checked style="width:auto">
+          Include subdirectories (recursive)
+        </label>
+      </div>
+      <div id="folderList" style="font-size:13px;color:var(--text2);max-height:100px;overflow-y:auto"></div>
     </div>
     <div id="uploadText" style="display:none">
       <div class="form-group"><label>Content</label><textarea id="textContent" placeholder="Paste or type content..."></textarea></div>
@@ -403,6 +440,8 @@ let currentTier = 0;
 let searchResults = [];
 let selectedId = null;
 let pendingFiles = [];
+let pendingFolderFiles = [];
+let currentUploadTab = 'file';
 
 async function api(path, opts) {
   const r = await fetch(path, opts);
@@ -561,10 +600,33 @@ function showUploadModal() { document.getElementById('uploadModal').classList.ad
 function closeModal(id) { document.getElementById(id).classList.remove('show'); }
 
 function switchUploadTab(btn, tab) {
+  currentUploadTab = tab;
   document.querySelectorAll('.modal .tier-tab').forEach(t => t.classList.remove('active'));
   btn.classList.add('active');
   document.getElementById('uploadFile').style.display = tab === 'file' ? '' : 'none';
+  document.getElementById('uploadFolder').style.display = tab === 'folder' ? '' : 'none';
   document.getElementById('uploadText').style.display = tab === 'text' ? '' : 'none';
+}
+
+function handleFolderDrop(e) {
+  // Folder drop handling - browsers handle this differently
+  if (e.dataTransfer.items) {
+    const items = Array.from(e.dataTransfer.items);
+    const fileItems = items.filter(item => item.kind === 'file');
+    const files = fileItems.map(item => item.getAsFile()).filter(f => f);
+    handleFolderFiles(files);
+  }
+}
+
+function handleFolderFiles(files) {
+  pendingFolderFiles = Array.from(files);
+  const folderNames = pendingFolderFiles.map(f => {
+    // Show relative path if available (webkitRelativePath)
+    return f.webkitRelativePath || f.name;
+  });
+  document.getElementById('folderList').innerHTML = folderNames.map(name =>
+    `<div>${esc(name)}</div>`
+  ).join('');
 }
 
 function handleDrop(e) { handleFiles(e.dataTransfer.files); }
@@ -578,7 +640,7 @@ async function doIngest() {
   const tags = document.getElementById('ingestTags').value;
   const textEl = document.getElementById('textContent');
 
-  if (textEl.offsetParent !== null && textEl.value.trim()) {
+  if (currentUploadTab === 'text' && textEl.value.trim()) {
     // Text mode
     const fd = new FormData();
     fd.append('text', textEl.value);
@@ -591,7 +653,45 @@ async function doIngest() {
       textEl.value = '';
       loadDocList(); loadStats();
     } catch (e) { toast('Ingest failed: ' + e.message, true); }
+  } else if (currentUploadTab === 'folder' && pendingFolderFiles.length) {
+    // Folder mode - upload all files to uploads directory, then ingest directory
+    toast('Uploading ' + pendingFolderFiles.length + ' files...');
+    let uploaded = 0;
+    let failed = 0;
+    
+    for (const f of pendingFolderFiles) {
+      const fd = new FormData();
+      fd.append('file', f);
+      fd.append('title', '');
+      fd.append('tags', tags);
+      try {
+        await api('/api/ingest', {method:'POST', body:fd});
+        uploaded++;
+      } catch (e) {
+        failed++;
+        console.error('Failed to upload:', f.name, e);
+      }
+    }
+    
+    // Now ingest the directory
+    const recursive = document.getElementById('recursiveCheck').checked;
+    const fd2 = new FormData();
+    fd2.append('tags', tags);
+    fd2.append('recursive', recursive.toString());
+    
+    try {
+      const r = await api('/api/ingest-directory', {method:'POST', body:fd2});
+      toast('Folder processed: ' + (r.success || 0) + ' files (' + uploaded + ' uploaded, ' + failed + ' failed)');
+    } catch (e) {
+      toast('Folder ingest: ' + uploaded + ' uploaded, but directory ingest failed', true);
+    }
+    
+    pendingFolderFiles = [];
+    document.getElementById('folderList').innerHTML = '';
+    closeModal('uploadModal');
+    loadDocList(); loadStats();
   } else if (pendingFiles.length) {
+    // Single file mode
     for (const f of pendingFiles) {
       const fd = new FormData();
       fd.append('file', f);
