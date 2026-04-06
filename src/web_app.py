@@ -6,8 +6,11 @@ Serves both API endpoints and the single-page frontend.
 import json
 import time
 import asyncio
+import threading
+import uuid
 from pathlib import Path
-from typing import Optional
+from typing import Optional, Dict
+from queue import Queue
 
 from fastapi import FastAPI, UploadFile, File, Query, HTTPException, Form
 from fastapi.responses import HTMLResponse, JSONResponse
@@ -19,6 +22,91 @@ from .retriever import HybridRetriever
 from .chunker import extract_text_from_file
 
 
+# Background processing state
+background_tasks: Dict[str, dict] = {}
+processing_queue = Queue()
+processing_lock = threading.Lock()
+
+def _background_processor(db_path: str, config: dict):
+    """Background thread that processes pending ingestion tasks."""
+    mm = MemoryManager(Database(db_path), config)
+    while True:
+        task = processing_queue.get()
+        if task is None:  # Sentinel to stop
+            break
+        task_id = task["task_id"]
+        start_time = time.time()
+        try:
+            background_tasks[task_id]["status"] = "processing"
+            background_tasks[task_id]["progress"] = 0
+            background_tasks[task_id]["start_time"] = start_time
+            
+            if task["type"] == "file":
+                # For single file, estimate progress based on time
+                background_tasks[task_id]["progress"] = 10  # Start processing
+                result = mm.ingest_file(task["file_path"], task.get("tags", []), task.get("title", ""))
+                background_tasks[task_id]["result"] = result
+                background_tasks[task_id]["progress"] = 100
+            elif task["type"] == "directory":
+                # For directory, we can track file count
+                upload_dir = Path(task["dir_path"])
+                if upload_dir.exists():
+                    supported = [".md", ".txt", ".py", ".js", ".ts", ".json", ".yaml", ".yml",
+                                ".toml", ".sql", ".sh", ".css", ".html", ".xml", ".ipynb",
+                                ".java", ".go", ".rs", ".c", ".cpp", ".h", ".rb", ".php"]
+                    pattern = "**/*" if task.get("recursive", True) else "*"
+                    files = [f for f in upload_dir.glob(pattern) if f.is_file() and f.suffix.lower() in supported]
+                    total_files = len(files)
+                    background_tasks[task_id]["total_files"] = total_files
+                    
+                    if total_files > 0:
+                        # Process files one by one and update progress
+                        processed = 0
+                        results = {"total_files": total_files, "success": 0, "failed": 0, "unchanged": 0, "details": []}
+                        
+                        for f in sorted(files):
+                            try:
+                                r = mm.ingest_file(str(f), tags=task.get("tags", []))
+                                processed += 1
+                                background_tasks[task_id]["progress"] = int((processed / total_files) * 100)
+                                background_tasks[task_id]["current_file"] = f.name
+                                
+                                if r["status"] == "success":
+                                    results["success"] += 1
+                                elif r["status"] == "unchanged":
+                                    results["unchanged"] += 1
+                                else:
+                                    results["failed"] += 1
+                                results["details"].append({"file": str(f), "result": r})
+                            except Exception as e:
+                                processed += 1
+                                results["failed"] += 1
+                                results["details"].append({"file": str(f), "error": str(e)})
+                        
+                        background_tasks[task_id]["result"] = results
+                        background_tasks[task_id]["progress"] = 100
+                    else:
+                        background_tasks[task_id]["result"] = {"total_files": 0, "success": 0, "message": "No supported files found"}
+                        background_tasks[task_id]["progress"] = 100
+                else:
+                    background_tasks[task_id]["result"] = {"status": "error", "message": "Directory not found"}
+                    background_tasks[task_id]["progress"] = 100
+                    
+            elif task["type"] == "text":
+                background_tasks[task_id]["progress"] = 10
+                result = mm.ingest_file(task["file_path"], task.get("tags", []), task.get("title", ""))
+                background_tasks[task_id]["result"] = result
+                background_tasks[task_id]["progress"] = 100
+                
+            background_tasks[task_id]["end_time"] = time.time()
+            background_tasks[task_id]["status"] = "completed"
+        except Exception as e:
+            background_tasks[task_id]["status"] = "failed"
+            background_tasks[task_id]["error"] = str(e)
+            background_tasks[task_id]["end_time"] = time.time()
+        
+        processing_queue.task_done()
+
 def create_app(db_path: str = "kb.db", config: dict = None) -> FastAPI:
     """Create and configure the FastAPI application."""
     config = config or {}
@@ -27,6 +115,10 @@ def create_app(db_path: str = "kb.db", config: dict = None) -> FastAPI:
     db = Database(db_path)
     mm = MemoryManager(db, config)
     retriever = HybridRetriever(db, mm.embedder, config)
+    
+    # Start background processor thread
+    processor_thread = threading.Thread(target=_background_processor, args=(db_path, config), daemon=True)
+    processor_thread.start()
 
     # --- API Routes ---
 
@@ -55,12 +147,30 @@ def create_app(db_path: str = "kb.db", config: dict = None) -> FastAPI:
             "results": [r.to_dict() for r in results],
         }
 
+    @app.post("/api/upload")
+    async def api_upload(
+        file: UploadFile = File(...),
+    ):
+        """Upload a single file only (fast). Parsing happens in background."""
+        upload_dir = Path("files/uploads")
+        upload_dir.mkdir(parents=True, exist_ok=True)
+        
+        dest = upload_dir / file.filename
+        dest.parent.mkdir(parents=True, exist_ok=True)
+        content = await file.read()
+        with open(dest, "wb") as f:
+            f.write(content)
+        
+        return {"status": "uploaded", "file": str(dest)}
+
     @app.post("/api/ingest")
     async def api_ingest(
         file: UploadFile = File(...),
         tags: str = Form(""),
         title: str = Form(""),
+        async_mode: bool = Form(False),
     ):
+        """Ingest a file. If async_mode=True, returns task_id immediately."""
         # Save uploaded file temporarily
         upload_dir = Path("files/uploads")
         upload_dir.mkdir(parents=True, exist_ok=True)
@@ -74,15 +184,37 @@ def create_app(db_path: str = "kb.db", config: dict = None) -> FastAPI:
             f.write(content)
 
         tag_list = [t.strip() for t in tags.split(",") if t.strip()] if tags else []
-        result = await asyncio.to_thread(
-            mm.ingest_file, str(dest), tag_list, title
-        )
-        return result
+        
+        if async_mode:
+            # Queue for background processing
+            task_id = str(uuid.uuid4())
+            background_tasks[task_id] = {
+                "status": "queued",
+                "progress": 0,
+                "type": "file",
+                "file_path": str(dest),
+                "tags": tag_list,
+                "title": title,
+            }
+            processing_queue.put({
+                "task_id": task_id,
+                "type": "file",
+                "file_path": str(dest),
+                "tags": tag_list,
+                "title": title,
+            })
+            return {"status": "queued", "task_id": task_id}
+        else:
+            result = await asyncio.to_thread(
+                mm.ingest_file, str(dest), tag_list, title
+            )
+            return result
 
     @app.post("/api/ingest-directory")
     async def api_ingest_directory(
         tags: str = Form(""),
         recursive: bool = Form(True),
+        async_mode: bool = Form(False),
     ):
         """Ingest all supported files from the uploads directory."""
         upload_dir = Path("files/uploads")
@@ -90,10 +222,30 @@ def create_app(db_path: str = "kb.db", config: dict = None) -> FastAPI:
             return {"status": "error", "message": "Upload directory not found"}
 
         tag_list = [t.strip() for t in tags.split(",") if t.strip()] if tags else []
-        result = await asyncio.to_thread(
-            mm.ingest_directory, str(upload_dir), recursive, tag_list
-        )
-        return result
+        
+        if async_mode:
+            task_id = str(uuid.uuid4())
+            background_tasks[task_id] = {
+                "status": "queued",
+                "progress": 0,
+                "type": "directory",
+                "dir_path": str(upload_dir),
+                "recursive": recursive,
+                "tags": tag_list,
+            }
+            processing_queue.put({
+                "task_id": task_id,
+                "type": "directory",
+                "dir_path": str(upload_dir),
+                "recursive": recursive,
+                "tags": tag_list,
+            })
+            return {"status": "queued", "task_id": task_id}
+        else:
+            result = await asyncio.to_thread(
+                mm.ingest_directory, str(upload_dir), recursive, tag_list
+            )
+            return result
 
     @app.post("/api/ingest-text")
     async def api_ingest_text(
@@ -118,6 +270,25 @@ def create_app(db_path: str = "kb.db", config: dict = None) -> FastAPI:
             mm.ingest_file, str(dest), tag_list, title
         )
         return result
+
+    @app.get("/api/task/{task_id}")
+    async def api_task_status(task_id: str):
+        """Get status of a background task."""
+        if task_id not in background_tasks:
+            raise HTTPException(404, "Task not found")
+        task = background_tasks[task_id]
+        return {
+            "task_id": task_id,
+            "status": task["status"],
+            "progress": task.get("progress", 0),
+            "result": task.get("result"),
+            "error": task.get("error"),
+        }
+
+    @app.get("/api/tasks")
+    async def api_tasks():
+        """Get all background tasks."""
+        return {"tasks": background_tasks}
 
     @app.get("/api/documents")
     async def api_documents(limit: int = 50, offset: int = 0):
@@ -442,6 +613,8 @@ let selectedId = null;
 let pendingFiles = [];
 let pendingFolderFiles = [];
 let currentUploadTab = 'file';
+let activeTasks = [];
+let pollingIntervals = {};
 
 async function api(path, opts) {
   const r = await fetch(path, opts);
@@ -654,18 +827,19 @@ async function doIngest() {
       loadDocList(); loadStats();
     } catch (e) { toast('Ingest failed: ' + e.message, true); }
   } else if (currentUploadTab === 'folder' && pendingFolderFiles.length) {
-    // Folder mode - upload all files to uploads directory, then ingest directory
+    // Folder mode - upload files first (fast), then process in background
     toast('Uploading ' + pendingFolderFiles.length + ' files...');
     let uploaded = 0;
     let failed = 0;
     
+    // Upload all files first (fast operation)
     for (const f of pendingFolderFiles) {
       const fd = new FormData();
       fd.append('file', f);
       fd.append('title', '');
       fd.append('tags', tags);
       try {
-        await api('/api/ingest', {method:'POST', body:fd});
+        await api('/api/upload', {method:'POST', body:fd});
         uploaded++;
       } catch (e) {
         failed++;
@@ -673,17 +847,23 @@ async function doIngest() {
       }
     }
     
-    // Now ingest the directory
+    toast(uploaded + ' files uploaded. Processing in background...');
+    
+    // Now start background processing
     const recursive = document.getElementById('recursiveCheck').checked;
     const fd2 = new FormData();
     fd2.append('tags', tags);
     fd2.append('recursive', recursive.toString());
+    fd2.append('async_mode', 'true');
     
     try {
       const r = await api('/api/ingest-directory', {method:'POST', body:fd2});
-      toast('Folder processed: ' + (r.success || 0) + ' files (' + uploaded + ' uploaded, ' + failed + ' failed)');
+      if (r.status === 'queued') {
+        toast('Processing started for ' + uploaded + ' files. Check progress in header.');
+        pollTaskStatus(r.task_id);
+      }
     } catch (e) {
-      toast('Folder ingest: ' + uploaded + ' uploaded, but directory ingest failed', true);
+      toast('Failed to start processing: ' + e.message, true);
     }
     
     pendingFolderFiles = [];
@@ -691,8 +871,42 @@ async function doIngest() {
     closeModal('uploadModal');
     loadDocList(); loadStats();
   } else if (pendingFiles.length) {
-    // Single file mode
-    for (const f of pendingFiles) {
+    // Single file mode - use async for multiple files
+    if (pendingFiles.length > 1) {
+      toast('Uploading ' + pendingFiles.length + ' files...');
+      for (const f of pendingFiles) {
+        const fd = new FormData();
+        fd.append('file', f);
+        fd.append('title', title);
+        fd.append('tags', tags);
+        try {
+          await api('/api/upload', {method:'POST', body:fd});
+        } catch (e) {
+          console.error('Failed to upload:', f.name, e);
+        }
+      }
+      
+      // Process each file in background
+      for (const f of pendingFiles) {
+        const fd = new FormData();
+        fd.append('file', f);
+        fd.append('title', title);
+        fd.append('tags', tags);
+        fd.append('async_mode', 'true');
+        try {
+          const r = await api('/api/ingest', {method:'POST', body:fd});
+          if (r.status === 'queued') {
+            pollTaskStatus(r.task_id);
+          }
+        } catch (e) {
+          console.error('Failed to queue:', f.name, e);
+        }
+      }
+      
+      toast(pendingFiles.length + ' files queued for processing');
+    } else {
+      // Single file - synchronous
+      const f = pendingFiles[0];
       const fd = new FormData();
       fd.append('file', f);
       fd.append('title', title);
@@ -702,12 +916,96 @@ async function doIngest() {
         toast(f.name + ': ' + (r.chunks_added || 0) + ' chunks');
       } catch (e) { toast(f.name + ' failed', true); }
     }
+    
     pendingFiles = [];
     document.getElementById('fileList').textContent = '';
     closeModal('uploadModal');
     loadDocList(); loadStats();
   } else {
     toast('No content to add', true);
+  }
+}
+
+function pollTaskStatus(taskId) {
+  activeTasks.push({id: taskId, startTime: Date.now()});
+  updateTaskIndicator();
+  
+  const interval = setInterval(async () => {
+    try {
+      const r = await api('/api/task/' + taskId);
+      if (r.status === 'completed' || r.status === 'failed') {
+        clearInterval(interval);
+        delete pollingIntervals[taskId];
+        activeTasks = activeTasks.filter(t => t.id !== taskId);
+        updateTaskIndicator();
+        
+        if (r.status === 'completed' && r.result) {
+          const chunks = r.result.chunks_added || r.result.success || 0;
+          toast('Processing complete: ' + chunks + ' chunks added');
+          loadDocList();
+          loadStats();
+        } else if (r.status === 'failed') {
+          toast('Processing failed: ' + (r.error || 'Unknown error'), true);
+        }
+      }
+    } catch (e) {
+      console.error('Error polling task:', e);
+    }
+  }, 1000);
+  
+  pollingIntervals[taskId] = interval;
+}
+
+function formatTime(seconds) {
+  if (seconds < 60) return Math.ceil(seconds) + 's';
+  if (seconds < 3600) return Math.ceil(seconds / 60) + 'm';
+  return Math.ceil(seconds / 3600) + 'h';
+}
+
+function updateTaskIndicator() {
+  const header = document.querySelector('header');
+  let indicator = document.getElementById('taskIndicator');
+  
+  if (activeTasks.length > 0) {
+    if (!indicator) {
+      indicator = document.createElement('span');
+      indicator.id = 'taskIndicator';
+      indicator.style.cssText = 'font-size:12px;color:var(--yellow);margin-left:8px;display:flex;align-items:center;gap:4px;';
+      header.appendChild(indicator);
+    }
+    
+    // Get latest progress for all active tasks
+    Promise.all(activeTasks.map(t => api('/api/task/' + t.id).catch(() => null)))
+      .then(results => {
+        const validResults = results.filter(r => r !== null);
+        if (validResults.length === 0) return;
+        
+        // Calculate average progress
+        const totalProgress = validResults.reduce((sum, r) => sum + (r.progress || 0), 0);
+        const avgProgress = Math.round(totalProgress / validResults.length);
+        
+        // Estimate time remaining based on current progress and elapsed time
+        let etaText = '';
+        if (avgProgress > 0 && avgProgress < 100) {
+          const elapsed = (Date.now() - activeTasks[0].startTime) / 1000;
+          const estimatedTotal = elapsed / (avgProgress / 100);
+          const remaining = estimatedTotal - elapsed;
+          if (remaining > 0) {
+            etaText = ' ~' + formatTime(remaining);
+          }
+        } else if (avgProgress >= 100) {
+          etaText = ' ✓';
+        }
+        
+        // Get current file if available
+        const currentFile = validResults[validResults.length - 1].current_file || '';
+        const fileText = currentFile ? ' | ' + currentFile.substring(0, 15) + (currentFile.length > 15 ? '...' : '') : '';
+        
+        indicator.innerHTML = '<span class="loading" style="width:12px;height:12px;flex-shrink:0"></span>' + 
+                             avgProgress + '%' + etaText + fileText;
+      });
+  } else if (indicator) {
+    indicator.remove();
   }
 }
 
